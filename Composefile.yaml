@@ -1,0 +1,348 @@
+version: "2"
+
+services:
+  mysql:
+    image: docker.io/library/mysql:8
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - eventhub-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+
+
+  postgres:
+    image: docker.io/library/postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - eventhub-net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+        ]
+
+      
+  mongodb:
+    image: docker.io/library/mongo:8
+    container_name: mongodb
+    volumes:
+      - eventhub-mongo:/data/db
+    networks:
+      - eventhub-net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "--eval",
+          "db.adminCommand('ping').ok"
+        ]
+   
+    
+  redis:
+    image: docker.io/library/redis:7
+    container_name: redis
+    volumes:
+      - redis_data:/data
+    networks:
+      - eventhub-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+
+
+  rabbitmq:
+    image: docker.io/library/rabbitmq:3-management
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - eventhub-net
+    ports:
+      - "15672:15672"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "rabbitmq-diagnostics",
+          "-q",
+          "ping"
+        ]
+   
+
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - eventhub-net
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "ollama",
+          "list"
+        ]
+
+
+
+
+
+  catalog-service:
+    build:
+      context: ./services/legacy-catalog-java
+    image: localhost/eventhub-catalog:latest
+    container_name: catalog-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    depends_on:
+      - mysql
+    networks:
+      - eventhub-net
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8081/api/catalog || exit 1"
+        ]
+
+
+
+  auth-service:
+    build:
+      context: ./services/auth-service-node
+    image: localhost/eventhub-auth:latest
+    container_name: auth-service
+    environment:
+      PORT: 8082
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    depends_on:
+      - postgres
+    networks:
+      - eventhub-net
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8082/health || exit 1"
+        ]
+
+
+
+  booking-service:
+    build:
+      context: ./services/booking-service-python
+    image: localhost/eventhub-booking:latest
+    container_name: booking-service
+    environment:
+      PORT: 8083
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DB: eventhub_bookings
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      AI_INSIGHT_URL: http://ai-insight-service:8084
+    depends_on:
+      - mongodb
+      - rabbitmq
+      - ai-insight-service
+    networks:
+      - eventhub-net
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8083/docs')"
+        ]
+ 
+
+  notification-worker:
+    build:
+      context: ./services/notification-worker-go
+    image: localhost/eventhub-notification-worker:latest
+    container_name: notification-worker
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      - rabbitmq
+    networks:
+      - eventhub-net
+
+
+  ai-insight-service:
+    build:
+      context: ./services/ai-insight-service-python
+    image: localhost/eventhub-ai-insight:latest
+    container_name: ai-insight-service
+    environment:
+      PORT: 8084
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      - ollama
+    networks:
+      - eventhub-net
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8084/docs')"
+        ]
+
+
+
+  analytics-service:
+    build:
+      context: ./services/analytics-service-python
+    image: localhost/eventhub-analytics:latest
+    container_name: analytics-service
+    environment:
+      PORT: 8085
+      REDIS_URL: redis://redis:6379/0
+      BOOKING_SERVICE_URL: http://booking-service:8083
+      CATALOG_SERVICE_URL: http://catalog-service:8081
+    depends_on:
+      - redis
+      - booking-service
+      - catalog-service
+    networks:
+      - eventhub-net
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8085/docs')"
+        ]
+    
+
+
+  gateway:
+    build:
+      context: ./gateway
+    image: localhost/eventhub-gateway:latest
+    container_name: gateway
+    environment:
+      PORT: 8080
+      AUTH_SERVICE_URL: http://auth-service:8082
+      CATALOG_SERVICE_URL: http://catalog-service:8081
+      BOOKING_SERVICE_URL: http://booking-service:8083
+    depends_on:
+      - auth-service
+      - catalog-service
+      - booking-service
+    networks:
+      - eventhub-net
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8080/ || exit 1"
+        ]
+
+
+
+  frontend:
+    build:
+      context: ./frontend
+    image: localhost/eventhub-frontend:latest
+    container_name: frontend
+    depends_on:
+      - gateway
+      - analytics-service
+    networks:
+      - eventhub-net
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:3000/ || exit 1"
+        ]
+
+      
+  analytics-job:
+    build:
+      context: ./services/analytics-service-python
+    image: localhost/eventhub-analytics:latest
+    container_name: analytics-job
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BOOKING_SERVICE_URL: http://booking-service:8083
+      CATALOG_SERVICE_URL: http://catalog-service:8081
+      SNAPSHOT_KEY: ${SNAPSHOT_KEY}
+    depends_on:
+      - redis
+      - booking-service
+      - catalog-service
+    networks:
+      - eventhub-net
+    command: >
+      sh -c "while true; do
+      python job.py;
+      sleep 10;
+      done"
+
+
+
+volumes:
+  mysql_data:
+    name: eventhub-mysql
+  postgres_data:
+    name: eventhub-postgres  
+  eventhub-mongo:
+    name: eventhub-mongo
+  redis_data:
+    name: eventhub-redis
+  rabbitmq_data:
+    name: eventhub-rabbitmq
+  ollama_data:
+    name: ollama-dataf
+
+
+
+
+networks:
+  eventhub-net:
+    name: eventhub-net
